@@ -143,8 +143,15 @@ class SecureToken
         }
         return substr($out, 0, $length);
     }
-    static function hkdf($algo, $sourceKey, $context = "", $salt = "")
+    static function hkdf($algo, $length, $sourceKey, $context = "", $salt = "")
     {
+        $hashlen = self::hashlen($algo);
+        $reps = ceil($length / $hashlen);
+        $out = "";
+        for ($i = 0; $i < $reps; $i++) {
+            $out .= self::hash($algo, $sourceKey . pack('N', $i) . $context);
+        }
+        return substr($out, 0, $length);
 
     }
 
@@ -274,7 +281,7 @@ class SecureToken
             ];
         case self::SECURE_TOKEN:
             if ($salt === null) {
-                $salt = random_bytes(self::SHA512_LENGTH);
+                $salt = self::random(self::SHA512_LENGTH);
             }
             return (object)[
                 'verify' => self::hkdf("sha512", self::SHA512_LENGTH, $key, "verify", $salt),
@@ -293,7 +300,7 @@ class SecureToken
         case self::COMPACT_TOKEN:
             return substr(self::hmac('sha1', $data, $key->verify), 0, 10);
         case self::SECURE_TOKEN:
-            return $key->salt . self::hkdf('sha512', $data, 'encrypt', $key->salt);
+            return $key->salt . self::hkdf('sha512', self::SHA512_LENGTH, $data, 'encrypt', $key->salt);
         }
         return null;
     }
@@ -322,7 +329,7 @@ class SecureToken
         $t = self::parse($token);
         $salt = null;
         if (($t->flags & self::TOKEN_TYPE_MASK) == self::SECURE_TOKEN) {
-            $salt = substr($t->key, 0, SHA512_LENGTH);
+            $salt = substr($t->sig, 0, self::SHA512_LENGTH);
         }
         $key = self::setupKey($key, $t->flags, $salt);
         $ptext = self::aes('decrypt', $t->payload, $key);
@@ -333,27 +340,46 @@ class SecureToken
         return substr($ptext, 0, $plen - 1);
     }
 
-    static function random($count)
+    static function random($length)
     {
         if (function_exists("random_bytes")) {
             return random_bytes($length);
         } else if (function_exists("openssl_random_pseudo_bytes")) {
-            return openssl_random_pseudo_bytes(self::AES_BLOCK_SIZE);
+            return openssl_random_pseudo_bytes($length);
         } else if (function_exists('mcrypt_create_iv')) {
             return mcrypt_create_iv($length, MCRYPT_DEV_URANDOM);
         }
         // TODO: PHP5 Windows support?
     }
 
-    static function newKey($flags)
+    static function generate($item, $flags)
     {
-        switch ($flags & self::TOKEN_TYPE_MASK) {
-        case self::QUICK_TOKEN:
-        case self::COMPACT_TOKEN:
-            return self::random(self::AES128_KEY_LENGTH);
-        case self::SECURE_TOKEN:
-            return self::random(self::AES256_KEY_LENGTH);
+        $len = 0;
+        switch ($item) {
+        case 'iv':
+            $len = self::AES_BLOCK_SIZE;
+            break;
+        case 'salt':
+            switch ($flags & self::TOKEN_TYPE_MASK) {
+            case self::QUICK_TOKEN:
+            case self::COMPACT_TOKEN:
+                break;
+            case self::SECURE_TOKEN:
+                $len = self::SHA256_LENGTH;
+            }
+            break;
+        case 'key':
+            switch ($flags & self::TOKEN_TYPE_MASK) {
+            case self::QUICK_TOKEN:
+            case self::COMPACT_TOKEN:
+                $len = self::AES128_KEY_LENGTH;
+                break;
+            case self::SECURE_TOKEN:
+                $len = self::AES256_KEY_LENGTH;
+            }
+            break;
         }
+        return $len ? self::random($len) : null;
     }
 
     function __construct($flags, $key = null)
@@ -362,11 +388,13 @@ class SecureToken
     }
 }
 
+$flags = SecureToken::COMPACT_TOKEN;
 $data = '{"did":1234567890}';
-$iv = SecureToken::random(SecureToken::AES_BLOCK_SIZE);
-$key = SecureToken::newKey(SecureToken::COMPACT_TOKEN);
+$iv = SecureToken::generate('iv', $flags);
+$key = SecureToken::generate('key', $flags);
+$salt = SecureToken::generate('salt', $flags);
 
-$tok = SecureToken::encode($data, $key, SecureToken::COMPACT_TOKEN);
+$tok = SecureToken::encode($data, $key, $flags, $salt, $iv);
 echo strlen($tok) . " bytes: $tok" . PHP_EOL;
 
 $t2 = SecureToken::decode($tok, $key);
