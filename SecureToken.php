@@ -54,9 +54,9 @@ namespace starekrow\Lockbox;
  * 
  *   - bits 0 - 3: key index
  *   - bits 4 - 5: token type
- *     0. Normal
- *     1. Compact
- *     2. Secure
+ *     0. Secure
+ *     1. Quick
+ *     2. Compact
  *     3. there is no 3
  *   - bit 6: data type
  *     0. binary string
@@ -71,7 +71,7 @@ namespace starekrow\Lockbox;
  * The token type selected affects the encryption and authentication of the
  * token, and influences its total length. The possible types are:
  * 
- *   - Normal: A normal token uses AES-128 for encryption, SHA-1 for the HMAC
+ *   - Quick: A quick token uses AES-128 for encryption, SHA-256 for the HMAC
  *     authentication, and KDF1 to generate keys.
  *   - Compact: Uses the same algorithms as the normal token, but only 
  *     includes the first 10 bytes of the HMAC for athentication.
@@ -89,21 +89,39 @@ namespace starekrow\Lockbox;
  * 
  * 
  */
-class Token
+class SecureToken
 {
-    function base64url_encode($input) {
-        return strtr(base64_encode($input), '+/=', '-_.');
+    const KEY_INDEX_MASK                =   0x0f;
+    const TOKEN_TYPE_MASK               =   0x30;
+
+    const SECURE_TOKEN                  =   0x00;
+    const QUICK_TOKEN                   =   0x10;
+    const COMPACT_TOKEN                 =   0x20;
+
+    const JSON_PAYLOAD                  =   0x40;
+
+    const AES_BLOCK_SIZE                =   16;
+    const AES128_KEY_LENGTH             =   16;
+    const AES256_KEY_LENGTH             =   16;
+    const SHA1_LENGTH                   =   20;
+    const SHA256_LENGTH                 =   32;
+    const SHA512_LENGTH                 =   64;
+
+    static $aesEncrypt;
+
+    static function base64url_encode($input) {
+        return str_replace('=', '', strtr(base64_encode($input), '+/', '-_'));
     }  
-    function base64url_decode($input) {
-        return base64_decode(strtr($input, '-_.', '+/='));
+    static function base64url_decode($input) {
+        return base64_decode(str_pad(strtr($input, '-_', '+/'), (4 - strlen($input)) & 3));
     }
     static function hashlen($algo)
     {
         switch (strtolower(str_replace('-', '', $algo))) {
-            case 'md5':             return 16;
-            case 'sha1':            return 20;
-            case 'sha256':          return 32;
-            case 'sha512':          return 64;
+        case 'md5':             return 16;
+        case 'sha1':            return 20;
+        case 'sha256':          return 32;
+        case 'sha512':          return 64;
         }
         return strlen(hash($algo,"test",true));
     }
@@ -115,17 +133,13 @@ class Token
     {
         return hash_hmac($algo, $data, $key, true);
     }
-    static function random($length)
-    {
-        return random_bytes($length);
-    }
     static function kdf1($algo, $length, $key, $context = "")
     {
         $hashlen = self::hashlen($algo);
         $reps = ceil($length / $hashlen);
         $out = "";
-        for ($i = 0; $i < reps; $i++) {
-            $out .= self::hash($key . pack('N', $i) . $context);
+        for ($i = 0; $i < $reps; $i++) {
+            $out .= self::hash($algo, $key . pack('N', $i) . $context);
         }
         return substr($out, 0, $length);
     }
@@ -134,21 +148,68 @@ class Token
 
     }
 
+    static function pkcs7pad($data, $blocksize)
+    {
+        $pad = $blocksize - (strlen($data) % $blocksize);
+        return $data . str_repeat(chr($pad), $pad);
+    }
+
+    static function pkcs7unpad($data, $blocksize)
+    {
+        $len = strlen($data);
+        $pad = ord($data[$len - 1]);
+        if ($pad < 1 || $pad > $blocksize || ($len - $pad) % $blocksize != 0) {
+            return null;
+        }
+        return substr($data, 0, $len - $pad);
+    }
+
+    static function aes_mcrypt($operation, $data, $key, $iv = null)
+    {
+        if ($operation == 'encrypt') {
+            $payload = self::pkcs7pad($data, self::AES_BLOCK_SIZE);
+            if (!$iv) {
+                $iv = mcrypt_create_iv(self::AES_BLOCK_SIZE, MCRYPT_DEV_URANDOM);
+            }
+            $crypt = mcrypt_encrypt(MCRYPT_RIJNDAEL_128, $key, $payload, MCRYPT_MODE_CBC, $iv);
+            return $iv . $crypt;
+        } else if ($operation == 'decrypt') {
+            $iv = substr($data, 0, self::AES_BLOCK_SIZE);
+            $ctext = substr($data, self::AES_BLOCK_SIZE);
+            $ptext = mcrypt_decrypt(MCRYPT_RIJNDAEL_128, $key, $ctext, MCRYPT_MODE_CBC, $iv);
+            return self::pkcs7unpad($ptext, self::AES_BLOCK_SIZE);
+        }
+        return null;
+    }
+
+    static function aes_openssl($operation, $data, $key)
+    {
+        if ($operation == 'encrypt') {
+            $iv = openssl_random_pseudo_bytes(self::AES_BLOCK_SIZE);
+            $bits = strlen($key->encrypt) << 3;
+            $crypt = openssl_encrypt($data , "AES-$bits-CBC", $key->encrypt, OPENSSL_RAW_DATA, $iv);
+            return $iv . $crypt;
+        } else if ($operation == 'decrypt') {
+            $iv = substr($data, 0, self::AES_BLOCK_SIZE);
+            $bits = strlen($key->encrypt) << 3;
+            $ctext = substr($data, self::AES_BLOCK_SIZE);
+            $ptext = openssl_decrypt($ctext, "AES-$bits-CBC", $key->encrypt, OPENSSL_RAW_DATA, $iv);
+            return $ptext;
+        }
+        return null;
+    }
+
     static function aes($operation, $data, $key)
     {
-
+        if (!self::$aesEncrypt) {
+            if (function_exists('openssl_encrypt')) {
+                self::$aesEncrypt = 'aes_openssl';
+            } else if (function_exists('mcrypt_encrypt')) {
+                self::$aesEncrypt = 'aes_mcrypt';
+            }    
+        }
+        return self::{self::$aesEncrypt}($operation, $data, $key);
     }
-
-    static function encode($data, $key, $flags = 0)
-    {
-
-    }
-
-    static function decode($data, $key)
-    {
-
-    }
-
     static function parse($data)
     {
         if (!$data || !is_string($data)) {
@@ -159,22 +220,154 @@ class Token
                                || strlen($parts[1]) < 1) {
             return null;
         }
-        if ()
-        
+        $header = self::base64url_decode($parts[0]);
+        $payload = self::base64url_decode($parts[1]);
+        if  ($header === null || $payload === null) {
+            return null;
+        }
+        return (object) [
+            'flags' => ord($header[0]),
+            'sig' => substr($header, 1),
+            'payload' => $payload
+        ];
     }
 
-    function sign($data)
+    static function flags($token)
     {
-
+        if (!is_string($token) || strlen($token) < 2) {
+            return null;
+        }
+        $v = self::base64url_decode(substr($token, 0, 4));
+        if (!is_array($v)) {
+            return null;
+        }
+        return ord($v[0]);
     }
 
-    function generate($data)
+    static function setupKey($key, $flags, $salt = null)
     {
-
+        if (is_array($key) && isset($key[$flags & self::KEY_INDEX_MASK])) {
+            $key = $key[$flags & self::KEY_INDEX_MASK];
+        }
+        if (is_array($key)) {
+            $key = (object)$key;
+        }
+        if (is_object($key) && isset($key->verify) && isset($key->encrypt)) {
+            if (($flags & self::TOKEN_TYPE_MASK) == self::SECURE_TOKEN && !isset($key->salt)) {
+                return null;
+            }
+            return $key;
+        }
+        if (!is_string($key)) {
+            return null;
+        }
+        switch ($flags & self::TOKEN_TYPE_MASK) {
+        case self::QUICK_TOKEN:
+            return (object)[
+                'verify' => self::kdf1("sha256", self::SHA256_LENNGTH, $key, "verify"),
+                'encrypt' => self::kdf1("sha256", self::AES128_KEY_LENGTH, $key, "encrypt")
+            ];
+        case self::COMPACT_TOKEN:
+            return (object)[
+                'verify' => self::kdf1("sha1", self::SHA1_LENGTH, $key, "verify"),
+                'encrypt' => self::kdf1("sha1", self::AES128_KEY_LENGTH, $key, "encrypt")
+            ];
+        case self::SECURE_TOKEN:
+            if ($salt === null) {
+                $salt = random_bytes(self::SHA512_LENGTH);
+            }
+            return (object)[
+                'verify' => self::hkdf("sha512", self::SHA512_LENGTH, $key, "verify", $salt),
+                'encrypt' => self::hkdf("sha256", self::AES256_KEY_LENGTH, $key, "encrypt"),
+                'salt' => $salt
+            ];
+        }
+        return null;
     }
 
-    function __construct($flags, $key)
+    static function sign($data, $key, $flags)
+    {
+        switch ($flags & self::TOKEN_TYPE_MASK) {
+        case self::QUICK_TOKEN:
+            return self::hmac('sha256', $data, $key->verify);
+        case self::COMPACT_TOKEN:
+            return substr(self::hmac('sha1', $data, $key->verify), 0, 10);
+        case self::SECURE_TOKEN:
+            return $key->salt . self::hkdf('sha512', $data, 'encrypt', $key->salt);
+        }
+        return null;
+    }
+
+    static function encode($data, $key, $flags = 0, $salt = null, $iv = null)
+    {
+        $key = self::setupKey($key, $flags, $salt);
+        if (!$key || !is_int($flags) || $flags > 127 || $flags < 0) {
+            return "";
+        }
+        if (!is_string($data)) {
+            $data = json_encode($data);
+            if ($data === null) {
+                return "";
+            }
+            $flags |= self::JSON_PAYLOAD;
+        }
+        $data .= chr($flags);
+        $header = chr($flags) . self::sign($data, $key, $flags);
+        $payload = self::aes('encrypt', $data, $key);
+        return self::base64url_encode($header) . '.' . self::base64url_encode($payload);
+    }
+
+    static function decode($token, $key)
+    {
+        $t = self::parse($token);
+        $salt = null;
+        if (($t->flags & self::TOKEN_TYPE_MASK) == self::SECURE_TOKEN) {
+            $salt = substr($t->key, 0, SHA512_LENGTH);
+        }
+        $key = self::setupKey($key, $t->flags, $salt);
+        $ptext = self::aes('decrypt', $t->payload, $key);
+        $plen = strlen($ptext);
+        if ($ptext === null || ord($ptext[$plen - 1]) !== $t->flags) {
+            return null;
+        }
+        return substr($ptext, 0, $plen - 1);
+    }
+
+    static function random($count)
+    {
+        if (function_exists("random_bytes")) {
+            return random_bytes($length);
+        } else if (function_exists("openssl_random_pseudo_bytes")) {
+            return openssl_random_pseudo_bytes(self::AES_BLOCK_SIZE);
+        } else if (function_exists('mcrypt_create_iv')) {
+            return mcrypt_create_iv($length, MCRYPT_DEV_URANDOM);
+        }
+        // TODO: PHP5 Windows support?
+    }
+
+    static function newKey($flags)
+    {
+        switch ($flags & self::TOKEN_TYPE_MASK) {
+        case self::QUICK_TOKEN:
+        case self::COMPACT_TOKEN:
+            return self::random(self::AES128_KEY_LENGTH);
+        case self::SECURE_TOKEN:
+            return self::random(self::AES256_KEY_LENGTH);
+        }
+    }
+
+    function __construct($flags, $key = null)
     {
 
     }
 }
+
+$data = '{"did":1234567890}';
+$iv = SecureToken::random(SecureToken::AES_BLOCK_SIZE);
+$key = SecureToken::newKey(SecureToken::COMPACT_TOKEN);
+
+$tok = SecureToken::encode($data, $key, SecureToken::COMPACT_TOKEN);
+echo strlen($tok) . " bytes: $tok" . PHP_EOL;
+
+$t2 = SecureToken::decode($tok, $key);
+echo $t2 . PHP_EOL;
