@@ -165,7 +165,7 @@ class SecureToken
     {
         $len = strlen($data);
         $pad = ord($data[$len - 1]);
-        if ($pad < 1 || $pad > $blocksize || ($len - $pad) % $blocksize != 0) {
+        if ($pad < 1 || $pad > $blocksize || $len % $blocksize != 0) {
             return null;
         }
         return substr($data, 0, $len - $pad);
@@ -178,12 +178,12 @@ class SecureToken
             if (!$iv) {
                 $iv = mcrypt_create_iv(self::AES_BLOCK_SIZE, MCRYPT_DEV_URANDOM);
             }
-            $crypt = mcrypt_encrypt(MCRYPT_RIJNDAEL_128, $key, $payload, MCRYPT_MODE_CBC, $iv);
+            $crypt = mcrypt_encrypt(MCRYPT_RIJNDAEL_128, $key->encrypt, $payload, MCRYPT_MODE_CBC, $iv);
             return $iv . $crypt;
         } else if ($operation == 'decrypt') {
             $iv = substr($data, 0, self::AES_BLOCK_SIZE);
             $ctext = substr($data, self::AES_BLOCK_SIZE);
-            $ptext = mcrypt_decrypt(MCRYPT_RIJNDAEL_128, $key, $ctext, MCRYPT_MODE_CBC, $iv);
+            $ptext = mcrypt_decrypt(MCRYPT_RIJNDAEL_128, $key->encrypt, $ctext, MCRYPT_MODE_CBC, $iv);
             return self::pkcs7unpad($ptext, self::AES_BLOCK_SIZE);
         }
         return null;
@@ -382,6 +382,11 @@ class SecureToken
         return $len ? self::random($len) : null;
     }
 
+    static function useLibrary($library)
+    {
+        self::$aesEncrypt = $library ? "aes_$library" : null;
+    }
+
     function __construct($flags, $key = null)
     {
 
@@ -394,8 +399,10 @@ $iv = SecureToken::generate('iv', $flags);
 $key = SecureToken::generate('key', $flags);
 $salt = SecureToken::generate('salt', $flags);
 
+//SecureToken::useLibrary("mcrypt");
 $tok = SecureToken::encode($data, $key, $flags, $salt, $iv);
 echo strlen($tok) . " bytes: $tok" . PHP_EOL;
 
+//SecureToken::useLibrary("openssl");
 $t2 = SecureToken::decode($tok, $key);
 echo $t2 . PHP_EOL;
